@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Design Controls Graph Editor (Web)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
+    <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh; }
+        #toolbar { padding: 10px; background: #f4f4f4; border-bottom: 1px solid #ccc; display: flex; flex-wrap: wrap; gap: 10px; }
+        #toolbar button, #toolbar select { font-size: 14px; padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; }
+        #toolbar button:hover { background: #eee; }
+        #toolbar button:disabled, #toolbar select:disabled { background: #f0f0f0; color: #999; cursor: not-allowed; }
+        #toolbar .separator { border-left: 1px solid #ccc; margin: 0 5px; }
+        #cy { flex-grow: 1; width: 100%; height: 100%; }
+        #status { position: fixed; bottom: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; padding: 5px 10px; border-radius: 4px; font-size: 14px; z-index: 100; opacity: 0; transition: opacity 0.3s; }
+    </style>
+</head>
+<body>
+
+    <div id="toolbar">
+        <button id="btn-vmodel">V-Model Layout</button>
+        <button id="btn-sort-type">Sort by Type</button>
+        <button id="btn-cose">Auto Layout (Cose)</button>
+        <div class="separator"></div>
+        <select id="select-hierarchy-type">
+            <option value="UN">UN</option>
+            <option value="IN">IN</option>
+            <option value="OU">OU</option>
+            <option value="VE">VE</option>
+            <option value="VA">VA</option>
+            <option value="TR">TR</option>
+        </select>
+        <button id="btn-toggle-hierarchy">Show Hierarchy</button>
+        <div class="separator"></div>
+        <select id="select-node-type">
+            <option value="UN">UN</option>
+            <option value="IN">IN</option>
+            <option value="OU">OU</option>
+            <option value="VE">VE</option>
+            <option value="VA">VA</option>
+            <option value="TR">TR</option>
+        </select>
+        <button id="btn-add-node">Add Node</button>
+        <div class="separator"></div>
+        <button id="btn-undo">Undo</button>
+        <button id="btn-redo">Redo</button>
+    </div>
+
+    <div id="config-overlay" style="position: fixed; top:0; left:0; width:100%; height:100%; background: white; z-index: 999; display: flex; flex-direction: column; align-items: center; justify-content: center;">
+        <h2>Design Controls Editor</h2>
+        <p>Please enter the full path to your synchronized adjacency matrix file.</p>
+        <p><em>Example: C:\Users\JSmith\OneDrive - Company\adjacency_matrix.txt</em></p>
+        <input type="text" id="file-path-input" placeholder="Paste full file path here" style="width: 400px; padding: 10px; margin-bottom: 10px;">
+        <button id="btn-load-file" style="padding: 10px 20px; font-size: 16px; cursor: pointer;">Load File</button>
+        <p id="config-msg" style="color: red;"></p>
+    </div>
+
+    <div id="cy"></div>
+    <div id="status">Connecting...</div>
+
+    <script>
+        const API_URL = "http://192.168.1.99:5000"; // Using your network IP
+        let selectedNode = null;
+        let isHierarchyView = false;
+
+        // --- Toolbar Element References ---
+        const btnVModel = document.getElementById('btn-vmodel');
+        const btnSortType = document.getElementById('btn-sort-type');
+        const btnCose = document.getElementById('btn-cose');
+        const selectHierarchyType = document.getElementById('select-hierarchy-type');
+        const btnToggleHierarchy = document.getElementById('btn-toggle-hierarchy');
+        const selectNodeType = document.getElementById('select-node-type');
+        const btnAddNode = document.getElementById('btn-add-node');
+        const btnUndo = document.getElementById('btn-undo');
+        const btnRedo = document.getElementById('btn-redo');
+        const statusEl = document.getElementById('status');
+        
+        // --- Helper Functions ---
+        function showStatus(message, duration = 2000) {
+            statusEl.innerText = message;
+            statusEl.style.opacity = 1;
+            setTimeout(() => { statusEl.style.opacity = 0; }, duration);
+        }
+
+        function toggleEditButtons(disabled) {
+            btnVModel.disabled = disabled;
+            btnSortType.disabled = disabled;
+            btnCose.disabled = disabled;
+            selectNodeType.disabled = disabled;
+            btnAddNode.disabled = disabled;
+            btnUndo.disabled = disabled;
+            btnRedo.disabled = disabled;
+            selectHierarchyType.disabled = disabled;
+        }
+        const configOverlay = document.getElementById('config-overlay');
+        const filePathInput = document.getElementById('file-path-input');
+        const btnLoadFile = document.getElementById('btn-load-file');
+        const configMsg = document.getElementById('config-msg');
+
+        // --- Cytoscape Initialization ---
+        const cy = cytoscape({
+            container: document.getElementById('cy'),
+            style: [
+                { selector: 'node', style: { 'label': 'data(label)', 'background-color': 'data(color)', 'border-width': 2, 'border-color': '#333', 'font-size': '16px', 'text-valign': 'center', 'text-halign': 'center', 'color': '#000' } },
+                { selector: 'node:selected', style: { 'border-color': 'blue', 'border-width': 4 } },
+                { selector: 'edge', style: { 'width': 2, 'line-color': '#999', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#999', 'curve-style': 'bezier' } }
+            ],
+            zoom: 1, minZoom: 0.1, maxZoom: 5, wheelSensitivity: 0.333
+        });
+
+        // --- Socket.IO Connection ---
+        const socket = io(API_URL);
+
+        // --- NEW: Register the Dagre layout adapter ---
+        cytoscape.use( cytoscapeDagre );
+
+        socket.on('connect', () => {
+            showStatus('Connected!', 1000);
+        });
+
+        socket.on('disconnect', () => {
+            showStatus('Disconnected! Retrying...', 10000);
+        });
+
+        // --- Socket.IO Event Listeners (No changes) ---
+        socket.on('graph_loaded', (elements) => {
+            cy.elements().remove();
+            cy.add(elements);
+            showStatus(`Graph re-synced with ${cy.nodes().length} nodes`);
+        });
+        
+        socket.on('layout_applied', (positions) => {
+            cy.layout({ name: 'preset', positions: positions, fit: true, padding: 30 }).run();
+        });
+
+        socket.on('node_added', (newNode) => {
+            cy.add(newNode);
+            const center = cy.pan();
+            const zoom = cy.zoom();
+            cy.nodes(`[id = "${newNode.data.id}"]`).position({ x: center.x / zoom, y: center.y / zoom });
+            showStatus(`Node ${newNode.data.id} added (by a user)`);
+        });
+
+        socket.on('edge_added', (newEdge) => {
+            cy.add(newEdge);
+            showStatus(`Edge ${newEdge.data.source} -> ${newEdge.data.target} added (by a user)`);
+        });
+
+        socket.on('node_removed', (data) => {
+            cy.nodes(`[id = "${data.id}"]`).remove();
+            showStatus(`Node ${data.id} removed (by a user)`);
+        });
+
+        socket.on('edge_removed', (data) => {
+            cy.edges(`[id = "${data.id}"]`).remove();
+            showStatus(`Edge removed (by a user)`);
+        });
+
+        socket.on('config_success', (data) => {
+            configOverlay.style.display = 'none';
+            showStatus(data.message);
+            socket.emit('load_layout_vmodel'); 
+        });
+
+        socket.on('config_error', (data) => {
+            configMsg.innerText = data.message;
+        });
+
+        // --- Toolbar Emitters (No changes) ---
+        
+        btnVModel.addEventListener('click', () => {
+            socket.emit('load_layout_vmodel');
+            showStatus("V-Model layout applied");
+        });
+        
+        btnSortType.addEventListener('click', () => {
+            socket.emit('load_layout_type');
+            showStatus("Sort-by-Type layout applied");
+        });
+
+        btnCose.addEventListener('click', () => {
+            cy.layout({ name: 'cose', animate: true, padding: 30, nodeRepulsion: 400000, idealEdgeLength: 100, nodeOverlap: 20 }).run();
+            showStatus("Running Cose layout...");
+        });
+        
+        
+        btnToggleHierarchy.addEventListener('click', () => {
+            isHierarchyView = !isHierarchyView;
+            
+            if (isHierarchyView) {
+                // --- Switch TO Hierarchy View ---
+                const type = selectHierarchyType.value;
+                
+                btnToggleHierarchy.innerText = "Show Full Graph";
+                toggleEditButtons(true);
+                
+                const nodes = cy.nodes(`[type = "${type}"]`);
+                const edges = nodes.edgesWith(nodes);
+                const graph = nodes.union(edges);
+                
+                cy.elements().difference(graph).hide();
+                
+                // --- MODIFIED: Use 'dagre' layout instead of 'breadthfirst' ---
+                graph.layout({ 
+                    name: 'dagre',
+                    rankDir: 'TB', // Top-to-Bottom ranking
+                    spacingFactor: 1.1,
+                    nodeSep: 50,  // Separation between nodes in same rank
+                    rankSep: 100, // Separation between ranks (layers)
+                    edgeSep: 10   // Separation between edges
+                }).run();
+                
+                cy.fit(graph, 30); // Fit view to graph with 30px padding
+                showStatus(`Showing ${type} Hierarchy`);
+
+            } else {
+                // --- Switch BACK to Full Graph View ---
+                btnToggleHierarchy.innerText = "Show Hierarchy";
+                toggleEditButtons(false); 
+                
+                cy.elements().show();
+                
+                socket.emit('load_layout_vmodel'); 
+                showStatus("Showing Full Graph");
+            }
+        });
+
+        btnUndo.addEventListener('click', () => socket.emit('undo'));
+        
+        btnRedo.addEventListener('click', () => socket.emit('redo'));
+
+        btnAddNode.addEventListener('click', () => {
+            const nodeType = selectNodeType.value;
+            socket.emit('add_node', { type: nodeType });
+        });
+
+        btnLoadFile.addEventListener('click', () => {
+            const path = filePathInput.value.replace(/"/g, ''); // Remove quotes if user copied as path
+            if(!path) return;
+            socket.emit('set_config', { filePath: path });
+            configMsg.innerText = "Attempting to load...";
+        });
+
+        // --- Graph Interactions (No changes) ---
+        cy.on('cxttap', 'node', (evt) => {
+            if (isHierarchyView) return;
+            const node = evt.target;
+            if (confirm(`Are you sure you want to delete node ${node.id()} and all its edges?`)) {
+                socket.emit('remove_node', { id: node.id() });
+            }
+        });
+
+        cy.on('tap', 'node', (evt) => {
+            if (isHierarchyView) return;
+            const node = evt.target;
+            
+            if (!selectedNode) {
+                selectedNode = node;
+                node.select();
+                showStatus(`Selected: ${node.id()}. Tap another node to add/remove edge.`);
+            } else {
+                const source = selectedNode.id();
+                const target = node.id();
+                
+                if (source === target) {
+                    selectedNode.unselect();
+                    selectedNode = null;
+                    showStatus("Selection cleared");
+                    return;
+                }
+
+                if (cy.edges(`[source = "${source}"][target = "${target}"]`).length > 0) {
+                    if (confirm(`Remove edge from ${source} to ${target}?`)) {
+                        socket.emit('remove_edge', { source: source, target: target });
+                    }
+                } else {
+                    socket.emit('add_edge', { source: source, target: target });
+                }
+
+                selectedNode.unselect();
+                selectedNode = null;
+            }
+        });
+
+        cy.on('tap', (evt) => {
+            if (isHierarchyView) return;
+            if (evt.target === cy && selectedNode) {
+                selectedNode.unselect();
+                selectedNode = null;
+                showStatus("Selection cleared");
+            }
+        });
+        
+    </script>
+</body>
+</html>
